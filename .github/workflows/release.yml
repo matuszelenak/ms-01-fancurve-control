@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches crate version
+        run: |
+          crate_version=$(grep -m1 '^version' server/Cargo.toml | cut -d'"' -f2)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match server/Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run tests
+        working-directory: server
+        run: cargo test --release
+
+      - name: Build .deb
+        working-directory: server
+        run: |
+          cargo install cargo-deb
+          cargo deb
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            server/target/debian/fancurve_*.deb \
+            --title "fancurve $GITHUB_REF_NAME" \
+            --generate-notes

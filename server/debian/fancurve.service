@@ -1,0 +1,22 @@
+[Unit]
+Description=Fan curve controller for MinisForum MS-01
+After=multi-user.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/fancurve
+Restart=on-failure
+RestartSec=5
+# Hand fans back to hardware auto control if the service is stopped.
+TimeoutStopSec=10
+
+# Hardening (/sys stays writable under ProtectSystem=strict; the config
+# directory needs an explicit exception)
+ProtectSystem=strict
+ReadWritePaths=/etc/fancurve
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

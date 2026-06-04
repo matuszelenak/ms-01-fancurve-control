@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+# The unit uses ReadWritePaths=/etc/fancurve, which must exist before the
+# service can start; the daemon then writes its default config there.
+mkdir -p /etc/fancurve
+
+#DEBHELPER#

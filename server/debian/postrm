@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# On purge, remove the saved fan curves.
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/fancurve
+fi
+
+#DEBHELPER#
