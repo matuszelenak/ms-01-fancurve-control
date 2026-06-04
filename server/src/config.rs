@@ -19,10 +19,14 @@ pub struct CurvePoint {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FanMode {
-    /// Hardware automatic control (restores the enable value seen at startup).
+    /// Firmware automatic control (restores the enable value and Smart Fan IV
+    /// points seen at startup).
     Auto,
     /// Software control following the configured curve.
     Curve,
+    /// The user's curve programmed into the chip's Smart Fan IV engine; the
+    /// hardware runs the loop autonomously (survives daemon/OS crashes).
+    Hardware,
     /// Software control at a fixed duty cycle.
     Manual,
 }
@@ -34,25 +38,64 @@ pub struct FanConfig {
     pub manual_pwm: f64,
     /// Curve points, kept sorted by temperature.
     pub curve: Vec<CurvePoint>,
+    /// Curve used in Hardware mode. Constrained by the Smart Fan IV engine:
+    /// a fixed number of points (5 on the nct6798) and non-decreasing duty.
+    #[serde(default = "default_hw_curve")]
+    pub hw_curve: Vec<CurvePoint>,
+}
+
+/// Default hardware curve; also used when loading configs that predate it.
+fn default_hw_curve() -> Vec<CurvePoint> {
+    vec![
+        CurvePoint { temp: 40.0, pwm: 20.0 },
+        CurvePoint { temp: 55.0, pwm: 30.0 },
+        CurvePoint { temp: 70.0, pwm: 50.0 },
+        CurvePoint { temp: 80.0, pwm: 75.0 },
+        CurvePoint { temp: 90.0, pwm: 100.0 },
+    ]
+}
+
+/// Linearly interpolate a curve at `temp`, returning percent (0-100).
+/// Clamps to the first/last point outside the curve's range.
+pub fn interpolate(pts: &[CurvePoint], temp: f64) -> f64 {
+    match pts.iter().position(|p| p.temp >= temp) {
+        Some(0) => pts[0].pwm,
+        Some(i) => {
+            let (a, b) = (pts[i - 1], pts[i]);
+            if (b.temp - a.temp).abs() < f64::EPSILON {
+                b.pwm
+            } else {
+                a.pwm + (b.pwm - a.pwm) * (temp - a.temp) / (b.temp - a.temp)
+            }
+        }
+        None => pts.last().map(|p| p.pwm).unwrap_or(100.0),
+    }
 }
 
 impl FanConfig {
-    /// Linearly interpolate the curve at `temp`, returning percent (0-100).
-    /// Clamps to the first/last point outside the curve's range.
+    /// Interpolate the software curve at `temp`.
     pub fn curve_pwm_at(&self, temp: f64) -> f64 {
-        let pts = &self.curve;
-        match pts.iter().position(|p| p.temp >= temp) {
-            Some(0) => pts[0].pwm,
-            Some(i) => {
-                let (a, b) = (pts[i - 1], pts[i]);
-                if (b.temp - a.temp).abs() < f64::EPSILON {
-                    b.pwm
-                } else {
-                    a.pwm + (b.pwm - a.pwm) * (temp - a.temp) / (b.temp - a.temp)
-                }
-            }
-            None => pts.last().map(|p| p.pwm).unwrap_or(100.0),
+        interpolate(&self.curve, temp)
+    }
+
+    /// The hardware curve resampled to exactly `count` points, as the chip
+    /// requires. A matching count passes through unchanged; otherwise points
+    /// are sampled evenly across the configured temperature span.
+    pub fn hw_points(&self, count: usize) -> Vec<CurvePoint> {
+        if self.hw_curve.len() == count || self.hw_curve.is_empty() || count < 2 {
+            return self.hw_curve.clone();
         }
+        let first = self.hw_curve[0].temp;
+        let last = self.hw_curve[self.hw_curve.len() - 1].temp;
+        (0..count)
+            .map(|i| {
+                let temp = first + (last - first) * i as f64 / (count - 1) as f64;
+                CurvePoint {
+                    temp,
+                    pwm: interpolate(&self.hw_curve, temp),
+                }
+            })
+            .collect()
     }
 }
 
@@ -83,11 +126,13 @@ impl Default for Config {
                     mode: FanMode::Auto,
                     manual_pwm: 50.0,
                     curve: curve.clone(),
+                    hw_curve: default_hw_curve(),
                 },
                 FanConfig {
                     mode: FanMode::Auto,
                     manual_pwm: 50.0,
                     curve,
+                    hw_curve: default_hw_curve(),
                 },
             ],
         }
@@ -156,6 +201,26 @@ impl Config {
             if fan.curve.windows(2).any(|w| w[1].temp < w[0].temp) {
                 bail!("fan {}: curve points must be sorted by temperature", i + 1);
             }
+            // The Smart Fan IV engine additionally requires non-decreasing
+            // duty; point count is matched to the chip in the control loop.
+            if !(2..=7).contains(&fan.hw_curve.len()) {
+                bail!("fan {}: hardware curve needs 2-7 points", i + 1);
+            }
+            for p in &fan.hw_curve {
+                if !(0.0..=120.0).contains(&p.temp) || !(0.0..=100.0).contains(&p.pwm) {
+                    bail!("fan {}: hardware curve point out of range: {p:?}", i + 1);
+                }
+            }
+            if fan
+                .hw_curve
+                .windows(2)
+                .any(|w| w[1].temp < w[0].temp || w[1].pwm < w[0].pwm)
+            {
+                bail!(
+                    "fan {}: hardware curve must have non-decreasing temperatures and duty",
+                    i + 1
+                );
+            }
         }
         Ok(())
     }
@@ -178,6 +243,7 @@ mod tests {
                 .iter()
                 .map(|&(temp, pwm)| CurvePoint { temp, pwm })
                 .collect(),
+            hw_curve: default_hw_curve(),
         }
     }
 
@@ -203,5 +269,26 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn hw_resampling() {
+        let f = fan(&[(0.0, 0.0)]); // software curve irrelevant here
+        // matching count passes through unchanged
+        assert_eq!(f.hw_points(5), f.hw_curve);
+        // resampled to 3 points: ends preserved, middle interpolated
+        let three = fan(&[(0.0, 0.0)]).hw_points(3);
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0], f.hw_curve[0]);
+        assert_eq!(three[2], f.hw_curve[4]);
+        assert_eq!(three[1].temp, 65.0);
+        assert_eq!(three[1].pwm, interpolate(&f.hw_curve, 65.0));
+    }
+
+    #[test]
+    fn hw_curve_must_be_monotonic() {
+        let mut cfg = Config::default();
+        cfg.fans[0].hw_curve[1].pwm = 5.0; // duty decreases after point 0
+        assert!(cfg.validate().is_err());
     }
 }

@@ -3,12 +3,13 @@ export interface CurvePoint {
   pwm: number
 }
 
-export type FanMode = 'auto' | 'curve' | 'manual'
+export type FanMode = 'auto' | 'curve' | 'hardware' | 'manual'
 
 export interface FanConfig {
   mode: FanMode
   manual_pwm: number
   curve: CurvePoint[]
+  hw_curve: CurvePoint[]
 }
 
 export interface Config {
@@ -32,6 +33,7 @@ export interface FanStatus {
   enable: number | null
   mode: FanMode | null
   target_pct: number | null
+  hw_points: number
 }
 
 export interface Status {

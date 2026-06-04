@@ -8,10 +8,22 @@
     /** Current fan output percent, drawn on the live marker. */
     livePwm?: number | null
     disabled?: boolean
+    /** Fixed number of points: adding and removing is not allowed. */
+    fixedPoints?: boolean
+    /** Duty may never decrease with temperature (Smart Fan IV constraint). */
+    monotonicPwm?: boolean
     onchange: (points: CurvePoint[]) => void
   }
 
-  let { points, liveTemp = null, livePwm = null, disabled = false, onchange }: Props = $props()
+  let {
+    points,
+    liveTemp = null,
+    livePwm = null,
+    disabled = false,
+    fixedPoints = false,
+    monotonicPwm = false,
+    onchange,
+  }: Props = $props()
 
   // Chart geometry
   const W = 720
@@ -90,11 +102,14 @@
     // Keep points ordered: clamp temp between neighbours (with 1°C gap)
     const lo = i > 0 ? points[i - 1].temp + 1 : T_MIN
     const hi = i < points.length - 1 ? points[i + 1].temp - 1 : T_MAX
+    // Smart Fan IV: duty must never decrease along the curve
+    const pwmLo = monotonicPwm && i > 0 ? points[i - 1].pwm : 0
+    const pwmHi = monotonicPwm && i < points.length - 1 ? points[i + 1].pwm : 100
     const next = points.map((p, j) =>
       j === i
         ? {
             temp: Math.round(clamp(invX(px), lo, hi)),
-            pwm: Math.round(clamp(invY(py), 0, 100)),
+            pwm: Math.round(clamp(invY(py), pwmLo, pwmHi)),
           }
         : p,
     )
@@ -109,7 +124,7 @@
   }
 
   function addPoint(e: MouseEvent) {
-    if (disabled) return
+    if (disabled || fixedPoints) return
     const { px, py } = svgCoords(e)
     const temp = Math.round(clamp(invX(px), T_MIN, T_MAX))
     const pwm = Math.round(clamp(invY(py), 0, 100))
@@ -120,7 +135,7 @@
 
   function removePoint(e: MouseEvent, i: number) {
     e.stopPropagation()
-    if (disabled || points.length <= 2) return
+    if (disabled || fixedPoints || points.length <= 2) return
     onchange(points.filter((_, j) => j !== i))
   }
 </script>
@@ -189,7 +204,11 @@
       </g>
     {/each}
   </svg>
-  <p class="hint">Drag points to shape the curve · double-click empty space to add · double-click a point to remove</p>
+  {#if fixedPoints}
+    <p class="hint">Drag the {points.length} points to shape the curve · the chip supports exactly {points.length} points and the duty can only rise with temperature</p>
+  {:else}
+    <p class="hint">Drag points to shape the curve · double-click empty space to add · double-click a point to remove</p>
+  {/if}
 </div>
 
 <style>

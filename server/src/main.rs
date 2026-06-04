@@ -21,9 +21,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let hw = Hardware::discover()?;
-
     let config_path = Config::path();
+    let snapshot_path = config_path.with_file_name("chip-snapshot.json");
+    let hw = Hardware::discover(&snapshot_path)?;
+
     let config = Config::load_or_default(&config_path)?;
     tracing::info!("config loaded from {}", config_path.display());
 

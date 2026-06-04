@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::config::{pct_to_raw, Config, FanMode};
+use crate::config::{pct_to_raw, Config, CurvePoint, FanMode};
 use crate::hwmon::Hardware;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -27,8 +27,11 @@ pub struct FanStatus {
     pub pwm_pct: Option<f64>,
     pub enable: Option<u32>,
     pub mode: Option<FanMode>,
-    /// The duty the controller is targeting (None in auto mode).
+    /// The duty the controller is targeting (None in auto/hardware modes,
+    /// where the chip runs the loop itself).
     pub target_pct: Option<f64>,
+    /// How many Smart Fan IV curve points the chip supports for this fan.
+    pub hw_points: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -49,10 +52,12 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 /// Per-fan bookkeeping so we only touch sysfs when something changes.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct FanRuntime {
     last_mode: Option<FanMode>,
     last_raw: Option<u8>,
+    /// The hardware curve last programmed into the chip.
+    last_hw_curve: Option<Vec<CurvePoint>>,
 }
 
 pub async fn run(state: SharedState) {
@@ -96,7 +101,7 @@ async fn tick(state: &SharedState, config: &Config, runtimes: &mut [FanRuntime])
         let rt = &mut runtimes[i];
 
         let target_pct = match (fan_cfg, mode) {
-            (Some(_), Some(FanMode::Auto)) | (None, _) => None,
+            (Some(_), Some(FanMode::Auto | FanMode::Hardware)) | (None, _) => None,
             (Some(cfg), Some(FanMode::Manual)) => Some(cfg.manual_pwm),
             (Some(cfg), Some(FanMode::Curve)) => match control_temp {
                 Some(t) => Some(cfg.curve_pwm_at(t)),
@@ -109,10 +114,12 @@ async fn tick(state: &SharedState, config: &Config, runtimes: &mut [FanRuntime])
             (Some(_), None) => None,
         };
 
-        // Apply mode transitions only when they change.
+        // Apply mode transitions only when they change. Hardware mode is
+        // handled below since it must also react to curve edits.
         if mode != rt.last_mode {
             let result = match mode {
                 Some(FanMode::Auto) | None => fan.set_auto(),
+                Some(FanMode::Hardware) => Ok(()),
                 Some(_) => fan.set_manual(),
             };
             match result {
@@ -120,8 +127,33 @@ async fn tick(state: &SharedState, config: &Config, runtimes: &mut [FanRuntime])
                     tracing::info!("fan {}: mode -> {:?}", fan.index, mode);
                     rt.last_mode = mode;
                     rt.last_raw = None;
+                    rt.last_hw_curve = None;
                 }
                 Err(e) => tracing::error!("fan {}: mode change failed: {e:#}", fan.index),
+            }
+        }
+
+        // Program the chip's Smart Fan IV engine when entering hardware mode
+        // or whenever the hardware curve changes.
+        if let (Some(cfg), Some(FanMode::Hardware)) = (fan_cfg, mode) {
+            if rt.last_hw_curve.as_ref() != Some(&cfg.hw_curve) {
+                let points: Vec<(i64, u8)> = cfg
+                    .hw_points(fan.auto_point_count())
+                    .iter()
+                    .map(|p| ((p.temp * 1000.0).round() as i64, pct_to_raw(p.pwm)))
+                    .collect();
+                match fan.set_hardware_curve(&points) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "fan {}: hardware curve programmed: {points:?}",
+                            fan.index
+                        );
+                        rt.last_hw_curve = Some(cfg.hw_curve.clone());
+                    }
+                    Err(e) => {
+                        tracing::error!("fan {}: hardware curve failed: {e:#}", fan.index)
+                    }
+                }
             }
         }
 
@@ -144,6 +176,7 @@ async fn tick(state: &SharedState, config: &Config, runtimes: &mut [FanRuntime])
             enable: fan.enable_value().ok(),
             mode,
             target_pct,
+            hw_points: fan.auto_point_count(),
         });
     }
 

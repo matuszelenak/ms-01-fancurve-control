@@ -13,8 +13,13 @@
   let { index, config, status, liveTemp, onchange }: Props = $props()
 
   const modes: { value: FanMode; label: string; hint: string }[] = [
-    { value: 'auto', label: 'Auto', hint: 'BIOS / hardware control' },
-    { value: 'curve', label: 'Curve', hint: 'follow the curve below' },
+    { value: 'auto', label: 'Auto', hint: 'firmware curve, as set by the BIOS' },
+    { value: 'curve', label: 'SW curve', hint: 'daemon follows the curve below (CPU package temp)' },
+    {
+      value: 'hardware',
+      label: 'HW curve',
+      hint: 'curve programmed into the fan chip — keeps running even if the daemon or OS dies',
+    },
     { value: 'manual', label: 'Manual', hint: 'fixed speed' },
   ]
 
@@ -73,13 +78,29 @@
     </div>
   {/if}
 
-  <CurveEditor
-    points={config.curve}
-    {liveTemp}
-    livePwm={config.mode === 'curve' ? (status?.target_pct ?? null) : null}
-    disabled={config.mode !== 'curve'}
-    onchange={(curve) => onchange({ ...config, curve })}
-  />
+  {#if config.mode === 'hardware'}
+    <p class="hw-note">
+      The curve below runs inside the nct6798's Smart Fan IV engine — limited to
+      {status?.hw_points ?? 5} points with non-decreasing duty, driven by the
+      board's CPU sensor (may read a few °C below the package temperature shown).
+    </p>
+    <CurveEditor
+      points={config.hw_curve}
+      {liveTemp}
+      livePwm={status?.pwm_pct ?? null}
+      fixedPoints
+      monotonicPwm
+      onchange={(hw_curve) => onchange({ ...config, hw_curve })}
+    />
+  {:else}
+    <CurveEditor
+      points={config.curve}
+      {liveTemp}
+      livePwm={config.mode === 'curve' ? (status?.target_pct ?? null) : null}
+      disabled={config.mode !== 'curve'}
+      onchange={(curve) => onchange({ ...config, curve })}
+    />
+  {/if}
 </section>
 
 <style>
@@ -157,5 +178,16 @@
     font-weight: 700;
     min-width: 48px;
     text-align: right;
+  }
+  .hw-note {
+    margin: 0 0 10px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: #9aa7ba;
+    background: #11151c;
+    border: 1px solid #2a3140;
+    border-left: 3px solid #4da3ff;
+    border-radius: 6px;
+    padding: 8px 12px;
   }
 </style>

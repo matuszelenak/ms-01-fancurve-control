@@ -18,14 +18,25 @@ Svelte frontend with an interactive, draggable fan-curve editor.
   readings have 1 °C resolution (integer Kelvin per the NVMe spec) and react
   too slowly to be useful control inputs.
 - **Per-fan modes**:
-  - `auto` — hardware control. The `pwmN_enable` value observed at service
-    startup (Smart Fan IV = `5` on this board) is restored. Writing `0`
+  - `auto` — firmware control. The `pwmN_enable` value and Smart Fan IV
+    curve points observed at service startup are restored. Writing `0`
     would not work here: on the nct6775 driver `0` means "full speed, no
-    control" — restoring the original value is what actually returns the fan
-    to BIOS automatic control.
-  - `curve` — `pwmN_enable=1` (manual) and the duty follows the configured
-    curve with linear interpolation between points, clamped at the ends.
+    control" — restoring the original values is what actually returns the
+    fan to BIOS automatic control.
+  - `curve` — `pwmN_enable=1` (manual) and the daemon drives the duty along
+    the configured curve with linear interpolation between points, clamped
+    at the ends.
+  - `hardware` — the user's curve is programmed into the chip's Smart Fan IV
+    engine (`pwmN_auto_point*`) and the hardware runs the control loop
+    autonomously: it keeps working even if the daemon or the whole OS dies.
+    Chip constraints, reflected in the editor: exactly 5 points,
+    non-decreasing duty, and the input is the board's CPU sensor (CPUTIN,
+    typically a few °C below the package temperature).
   - `manual` — fixed duty cycle.
+- **Firmware state snapshot**: the BIOS-programmed fan settings are captured
+  at the first start of each boot and persisted
+  (`/etc/fancurve/chip-snapshot.json`, keyed by boot id), so `auto` restores
+  the true BIOS curve even after the daemon crashed while in hardware mode.
 - **Failsafes**: if no temperature can be read in curve mode the fans go to
   100%; on shutdown (SIGTERM/Ctrl-C) all fans are returned to hardware auto.
 - **Config** is persisted as JSON at `/etc/fancurve/config.json` (override

@@ -1,6 +1,6 @@
 [package]
 name = "fancurve"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fan curve controller for MinisForum MS-01"
 license = "Unlicense"

@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 const HWMON_ROOT: &str = "/sys/class/hwmon";
 
@@ -49,6 +50,15 @@ fn read_temp(path: &Path) -> Result<f64> {
     Ok(milli as f64 / 1000.0)
 }
 
+/// One point of the chip's built-in Smart Fan IV curve.
+struct AutoPointFiles {
+    temp: PathBuf,
+    pwm: PathBuf,
+}
+
+/// Smart Fan IV mode for `pwm{N}_enable`.
+const ENABLE_SMART_FAN: u32 = 5;
+
 /// One PWM-controllable fan on the Super I/O chip (nct6798).
 pub struct PwmFan {
     /// 1-based index as used in sysfs file names (pwm1, fan1_input, ...).
@@ -58,6 +68,11 @@ pub struct PwmFan {
     fan_input: PathBuf,
     /// `pwm{N}_enable` value observed at startup; restored for "auto" mode.
     pub original_enable: u32,
+    /// The chip's Smart Fan IV curve registers (`pwm{N}_auto_point*`).
+    auto_points: Vec<AutoPointFiles>,
+    /// Auto point values observed at startup (millidegrees, raw pwm);
+    /// restored together with `original_enable` for "auto" mode.
+    original_auto_points: Vec<(i64, u32)>,
 }
 
 impl PwmFan {
@@ -78,9 +93,44 @@ impl PwmFan {
         fs::write(&self.enable, "1").with_context(|| format!("writing {}", self.enable.display()))
     }
 
-    /// Return the fan to the automatic mode that was active at startup.
+    /// Return the fan to the automatic mode that was active at startup,
+    /// including the firmware-programmed Smart Fan IV curve points (which
+    /// hardware mode may have overwritten).
     pub fn set_auto(&self) -> Result<()> {
+        for (files, &(temp, pwm)) in self.auto_points.iter().zip(&self.original_auto_points) {
+            fs::write(&files.temp, temp.to_string())
+                .with_context(|| format!("writing {}", files.temp.display()))?;
+            fs::write(&files.pwm, pwm.to_string())
+                .with_context(|| format!("writing {}", files.pwm.display()))?;
+        }
         fs::write(&self.enable, self.original_enable.to_string())
+            .with_context(|| format!("writing {}", self.enable.display()))
+    }
+
+    /// Number of Smart Fan IV curve points the chip supports for this fan.
+    pub fn auto_point_count(&self) -> usize {
+        self.auto_points.len()
+    }
+
+    /// Program the chip's Smart Fan IV curve and let the hardware run the
+    /// control loop autonomously. `points` are (millidegrees C, raw pwm),
+    /// sorted by temperature, one per chip auto point.
+    pub fn set_hardware_curve(&self, points: &[(i64, u8)]) -> Result<()> {
+        if points.len() != self.auto_points.len() {
+            bail!(
+                "fan {} expects {} auto points, got {}",
+                self.index,
+                self.auto_points.len(),
+                points.len()
+            );
+        }
+        for (files, &(temp, pwm)) in self.auto_points.iter().zip(points) {
+            fs::write(&files.temp, temp.to_string())
+                .with_context(|| format!("writing {}", files.temp.display()))?;
+            fs::write(&files.pwm, pwm.to_string())
+                .with_context(|| format!("writing {}", files.pwm.display()))?;
+        }
+        fs::write(&self.enable, ENABLE_SMART_FAN.to_string())
             .with_context(|| format!("writing {}", self.enable.display()))
     }
 
@@ -111,6 +161,59 @@ impl TempSensor {
     }
 }
 
+/// Reconcile the fans' "original" firmware state with the persisted
+/// snapshot: within the same boot the file wins (the chip may already hold
+/// our values from a previous daemon run); on a new boot the chip wins and
+/// the file is rewritten. Failures only cost restore fidelity, so they warn
+/// instead of aborting.
+fn apply_snapshot(fans: &mut [PwmFan], path: &Path) {
+    let boot_id = current_boot_id();
+
+    let saved: Option<ChipSnapshot> = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .filter(|s: &ChipSnapshot| !boot_id.is_empty() && s.boot_id == boot_id);
+
+    if let Some(snap) = saved {
+        for fan in fans.iter_mut() {
+            if let Some(f) = snap.fans.iter().find(|f| f.index == fan.index) {
+                if f.auto_points.len() == fan.auto_points.len() {
+                    fan.original_enable = f.enable;
+                    fan.original_auto_points = f.auto_points.clone();
+                }
+            }
+        }
+        tracing::info!(
+            "firmware fan state loaded from {} (daemon restarted within this boot)",
+            path.display()
+        );
+        return;
+    }
+
+    let snap = ChipSnapshot {
+        boot_id,
+        fans: fans
+            .iter()
+            .map(|fan| FanSnapshot {
+                index: fan.index,
+                enable: fan.original_enable,
+                auto_points: fan.original_auto_points.clone(),
+            })
+            .collect(),
+    };
+    match serde_json::to_string_pretty(&snap)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(path, json).map_err(Into::into)
+        }) {
+        Ok(()) => tracing::info!("firmware fan state snapshotted to {}", path.display()),
+        Err(e) => tracing::warn!("could not persist firmware snapshot: {e:#}"),
+    }
+}
+
 /// Look up an NVMe drive's model name via `smartctl -i`, falling back to the
 /// sysfs `model` attribute. Called once at startup.
 fn nvme_model(chip: &Path, dev: &str) -> Option<String> {
@@ -134,6 +237,32 @@ fn nvme_model(chip: &Path, dev: &str) -> Option<String> {
     })
 }
 
+/// Firmware chip state captured before this service first touched it.
+///
+/// The values are only trustworthy when read from a chip the daemon has not
+/// yet written to. If the daemon crashes in hardware mode and restarts, the
+/// chip still holds *our* curve — so the snapshot taken at the first start of
+/// each boot is persisted and reused for the rest of that boot. After a
+/// reboot the BIOS reprograms the chip and a fresh snapshot is taken.
+#[derive(Serialize, Deserialize)]
+struct ChipSnapshot {
+    boot_id: String,
+    fans: Vec<FanSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FanSnapshot {
+    index: u32,
+    enable: u32,
+    auto_points: Vec<(i64, u32)>,
+}
+
+fn current_boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// All hardware handles the controller needs.
 pub struct Hardware {
     pub fans: Vec<PwmFan>,
@@ -142,8 +271,9 @@ pub struct Hardware {
 
 impl Hardware {
     /// Discover the nct6798 fan controller, the CPU package sensor and all
-    /// NVMe composite sensors.
-    pub fn discover() -> Result<Hardware> {
+    /// NVMe composite sensors. `snapshot_path` persists the firmware fan
+    /// state across daemon restarts within one boot.
+    pub fn discover(snapshot_path: &Path) -> Result<Hardware> {
         let nct = find_chips(|n| n.starts_with("nct67"))
             .into_iter()
             .next()
@@ -160,13 +290,36 @@ impl Hardware {
                 bail!("missing {} or {}", pwm.display(), enable.display());
             }
             let original_enable = read_u32(&enable)?;
-            tracing::info!("fan {index}: original pwm{index}_enable = {original_enable}");
+
+            // Enumerate the chip's Smart Fan IV curve registers and snapshot
+            // the firmware-programmed values so "auto" can restore them.
+            let mut auto_points = Vec::new();
+            let mut original_auto_points = Vec::new();
+            for point in 1.. {
+                let temp = nct.join(format!("pwm{index}_auto_point{point}_temp"));
+                let pwm = nct.join(format!("pwm{index}_auto_point{point}_pwm"));
+                if !temp.exists() || !pwm.exists() {
+                    break;
+                }
+                let temp_val: i64 = read_trimmed(&temp)?
+                    .parse()
+                    .with_context(|| format!("parsing {}", temp.display()))?;
+                original_auto_points.push((temp_val, read_u32(&pwm)?));
+                auto_points.push(AutoPointFiles { temp, pwm });
+            }
+            tracing::info!(
+                "fan {index}: original pwm{index}_enable = {original_enable}, \
+                 {} hardware curve points",
+                auto_points.len()
+            );
             fans.push(PwmFan {
                 index,
                 pwm,
                 enable,
                 fan_input,
                 original_enable,
+                auto_points,
+                original_auto_points,
             });
         }
 
@@ -229,6 +382,8 @@ impl Hardware {
                 input,
             });
         }
+
+        apply_snapshot(&mut fans, snapshot_path);
 
         if !sensors.iter().any(|s| s.control) {
             bail!("no CPU package temperature sensor found (needed for fan control)");
